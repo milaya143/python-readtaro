@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 
 # ── config ────────────────────────────────────────────────────────────────────
-TOKEN    = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN    = "@ontobe"          # where booking notifications go
 ADMIN_ID = None               # filled automatically on first /start from admin
 

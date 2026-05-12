@@ -228,8 +228,7 @@ async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         f"✨ Заявка принята!\n\n"
         f"Я свяжусь с тобой в ближайшее время и пришлю реквизиты для оплаты. "
-        f"После подтверждения оплаты согласуем удобное время для сессии.\n\n"
-        f"Если есть вопросы — пиши напрямую: {ADMIN}",
+        f"После подтверждения оплаты согласуем удобное время для сессии.\n\n",
         parse_mode="Markdown"
     )
     ctx.user_data.clear()

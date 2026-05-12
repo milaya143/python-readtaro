@@ -18,7 +18,7 @@ from telegram.ext import (
 # ── config ────────────────────────────────────────────────────────────────────
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN    = "@ontobe"          # where booking notifications go
-ADMIN_ID = None               # filled automatically on first /start from admin
+ADMIN_ID = 8288323625               # filled automatically on first /start from admin
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -202,7 +202,7 @@ async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     try:
         await ctx.bot.send_message(
-            chat_id=ADMIN.lstrip("@"),
+            chat_id=ADMIN,
             text=admin_text,
             parse_mode="Markdown"
         )

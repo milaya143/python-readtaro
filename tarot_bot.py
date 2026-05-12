@@ -9,7 +9,18 @@ import logging
 import asyncio
 from flask import Flask
 from threading import Thread
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+)
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, filters, ContextTypes
+)
 
+# ── config ────────────────────────────────────────────────────────────────────
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+ADMIN    = 8288323625          # where booking notifications go
+ADMIN_ID = 8288323625               # filled automatically on first /start from admin
 app = Flask('')
 
 @app.route('/')
@@ -22,18 +33,6 @@ def run():
 def keep_alive():
     t = Thread(target=run)
     t.start()
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ConversationHandler, filters, ContextTypes
-)
-
-# ── config ────────────────────────────────────────────────────────────────────
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN    = "@ontobe"          # where booking notifications go
-ADMIN_ID = 8288323625               # filled automatically on first /start from admin
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -261,6 +260,7 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main():
+    keep_alive()
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(

@@ -216,7 +216,7 @@ async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     try:
         await ctx.bot.send_message(
-            chat_id=ADMIN,
+            chat_id=8288323625,
             text=admin_text,
             parse_mode="Markdown"
         )

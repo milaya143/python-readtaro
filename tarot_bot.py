@@ -4,6 +4,7 @@ Tarot consultation bot
 Admin notifications → @ontobe
 """
 
+import os
 import logging
 import asyncio
 from telegram import (

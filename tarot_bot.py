@@ -1,283 +1,916 @@
 #!/usr/bin/env python3
 """
-Tarot consultation bot
-Admin notifications → @ontobe
+Tarot Bot — final production version
+═══════════════════════════════════════════════════════════
+Переменные окружения (Render → Environment):
+  BOT_TOKEN      токен от @BotFather
+  ADMIN_UN       username без @
+  CARD_NUMBER    номер карты
+  CARD_NAME      имя на карте латиницей
+  BANK_NAME      название банка
+
+Команды администратора:
+  /clients          очередь заявок (приоритет: день первым)
+  /paid <id>        подтвердить оплату
+  /cancel_pay <id>  отменить заявку
+  /questions        клиенты с правом на уточняющий вопрос
+  /answer <id> текст   ответить на уточняющий вопрос
+  /promos           список активных промокодов
+  /support_list     входящие обращения
+  /reply <id> текст    ответить на обращение
+═══════════════════════════════════════════════════════════
 """
 
-import os
-import logging
-import asyncio
-from flask import Flask
-from threading import Thread
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
-)
+import os, logging, random, string, sqlite3
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ConversationHandler, filters, ContextTypes
 )
 
-# ── config ────────────────────────────────────────────────────────────────────
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN    = 8288323625          # where booking notifications go
-ADMIN_ID = 8288323625               # filled automatically on first /start from admin
-app = Flask('')
+# ── ENV ───────────────────────────────────────────────────────────────────────
+TOKEN       = os.environ["BOT_TOKEN"]
+ADMIN_UN    = os.environ["ADMIN_UN"].lstrip("@")
+CARD_NUMBER = os.environ["CARD_NUMBER"]
+CARD_NAME   = os.environ["CARD_NAME"]
+BANK_NAME   = os.environ["BANK_NAME"]
+DISCOUNT_PCT = 20
+DB_PATH     = "tarot.db"
 
-@app.route('/')
-def home():
-    return "I'm alive"
-
-def run():
-    app.run(host='0.0.0.0', port=10000) # Render обычно ищет порт 10000
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-    
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s — %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
-)
 log = logging.getLogger(__name__)
 
-# ── conversation states ───────────────────────────────────────────────────────
-CHOOSE_SERVICE, ASK_NAME, ASK_QUESTION, ASK_CONTACT, CONFIRM = range(5)
+# ── DATABASE ──────────────────────────────────────────────────────────────────
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
-# ── services ──────────────────────────────────────────────────────────────────
+def init_db():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id     INTEGER PRIMARY KEY,
+            username    TEXT DEFAULT '',
+            first_name  TEXT DEFAULT '',
+            consented   INTEGER DEFAULT 0,
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS orders (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            service     TEXT NOT NULL,
+            question    TEXT NOT NULL,
+            contact     TEXT NOT NULL,
+            status      TEXT DEFAULT 'awaiting_payment',
+            ordered_at  TEXT DEFAULT (datetime('now')),
+            paid_at     TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code        TEXT PRIMARY KEY,
+            owner_id    INTEGER NOT NULL,
+            discount    INTEGER DEFAULT 20,
+            used        INTEGER DEFAULT 0,
+            used_by     INTEGER,
+            created_at  TEXT DEFAULT (datetime('now')),
+            used_at     TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS question_window (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            order_id    INTEGER NOT NULL,
+            expires_at  TEXT NOT NULL,
+            used        INTEGER DEFAULT 0,
+            asked_at    TEXT,
+            question    TEXT,
+            answered    INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            username    TEXT DEFAULT '',
+            first_name  TEXT DEFAULT '',
+            category    TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now')),
+            resolved    INTEGER DEFAULT 0
+        );
+        """)
+    log.info("Database ready")
+
+# ── STATES ────────────────────────────────────────────────────────────────────
+(CONSENT,
+ CHOOSE_SERVICE, ASK_NAME, ASK_QUESTION, ASK_CONTACT, CONFIRM,
+ SUPPORT_CHOOSE, SUPPORT_MESSAGE,
+ PROMO_INPUT) = range(9)
+
+# ── SERVICES ──────────────────────────────────────────────────────────────────
 SERVICES = {
-    "yn":    {"name": "Расклад да/нет",          "desc": "2 карты · быстрый ответ на конкретный вопрос",          "price": "490 ₽",  "duration": "~5 мин"},
-    "day":   {"name": "Расклад на день",          "desc": "2 карты · энергия и ключевая тема твоего дня",          "price": "490 ₽",  "duration": "~5 мин"},
-    "mini":  {"name": "Мини-расклад на вопрос",   "desc": "Отношения / деньги / любая тема · глубокий ответ",      "price": "2 990 ₽","duration": "~15 мин"},
-    "full":  {"name": "Большой расклад",          "desc": "Полная сессия · комплексный анализ ситуации",           "price": "5 500 ₽","duration": "~60 мин"},
+    "yn":   {"name": "Расклад Да/Нет",        "desc": "2 карты · быстрый ответ на конкретный вопрос",     "price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 2},
+    "day":  {"name": "Расклад на день",        "desc": "2 карты · энергия и ключевая тема ближайших суток","price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 1},
+    "mini": {"name": "Мини-расклад на вопрос", "desc": "Отношения / деньги / любая тема · глубокий ответ", "price": "3 000 ₽", "amount": 3000, "duration": "согласуем время",   "priority": 2},
+    "full": {"name": "Большой расклад",        "desc": "Полная сессия · комплексный анализ ситуации",      "price": "5 000 ₽", "amount": 5000, "duration": "согласуем время",   "priority": 3},
 }
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-def service_keyboard():
-    rows = []
-    for key, s in SERVICES.items():
-        rows.append([InlineKeyboardButton(
-            f"{s['name']}  —  {s['price']}", callback_data=f"svc_{key}"
-        )])
-    rows.append([InlineKeyboardButton("❓ Как проходит консультация?", callback_data="faq")])
-    return InlineKeyboardMarkup(rows)
+FAQ = {
+    "faq_how":    ("Как проходит консультация?",
+                   "Онлайн — голосом или текстом в Telegram, как тебе удобнее. "
+                   "Я соединяю Таро с психологическим анализом. Это не предсказание будущего — "
+                   "это разговор о твоих паттернах, ресурсах и возможных путях."),
+    "faq_pay":    ("Как оплатить?",
+                   "После подтверждения заявки бот пришлёт реквизиты карты. "
+                   "Обычный банковский перевод, комментарий писать не нужно. "
+                   "Я подтверждаю оплату вручную и присылаю всё необходимое."),
+    "faq_time":   ("Когда получу расклад?",
+                   "Заявки обрабатываются в рабочее время. "
+                   "Если заявка пришла ночью или поздно вечером — отвечу утром ☽\n\n"
+                   "Расклад на день и Да/Нет — в порядке живой очереди.\n"
+                   "Мини и Большой расклад — согласуем удобное время лично."),
+    "faq_cancel": ("Можно отменить и вернуть деньги?",
+                   "Если я ещё не начала расклад — да, возврат полный. "
+                   "Напиши через кнопку «Вопрос / проблема» — разберём в течение дня."),
+    "faq_promo":  ("Как использовать промокод?",
+                   "Напиши /promo в любой момент и введи код. "
+                   "Скидка применится к следующей услуге автоматически. "
+                   "Промокоды одноразовые и не суммируются."),
+}
 
-def back_keyboard():
+PAID_CONTENT = {
+    "yn": (
+        "🌙 *Оплата подтверждена — расклад Да/Нет*\n\n"
+        "Я уже в очереди на твой вопрос.\n\n"
+        "Пришлю результат в рабочее время — если заявка пришла ночью, жди утром ☽\n\n"
+        "Если хочешь уточнить формулировку вопроса — напиши прямо сейчас."
+    ),
+    "day": (
+        "🌙 *Оплата подтверждена — расклад на день*\n\n"
+        "Твоя заявка в очереди.\n\n"
+        "Расклад пришлю в рабочее время — постараюсь максимально быстро ☽"
+    ),
+    "mini": (
+        "🌙 *Оплата подтверждена — мини-расклад*\n\n"
+        "Напишу тебе лично — согласуем удобный момент для сессии.\n\n"
+        "Формат (голос или текст) выберем вместе ☽"
+    ),
+    "full": (
+        "🌙 *Оплата подтверждена — большой расклад*\n\n"
+        "Рада, что ты здесь.\n\n"
+        "Напишу тебе лично — согласуем время для нашей сессии.\n\n"
+        "Всё что нужно — это ты и твой вопрос. Больше ничего готовить не нужно ☽"
+    ),
+}
+
+FULL_BONUSES = (
+    "\n\n✨ *Твои бонусы к большому раскладу:*\n\n"
+    "1️⃣ *Уточняющий вопрос* — в течение 24 часов после сессии ты можешь задать один вопрос по итогам. "
+    "Напиши /ask — бот примет его и передаст мне.\n\n"
+    "2️⃣ *Промокод на скидку 20%* — на следующий расклад (любой). "
+    "Можно передарить другу или близкому. Пришлю отдельным сообщением."
+)
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+def is_admin(user) -> bool:
+    return bool(user.username and user.username.lower() == ADMIN_UN.lower())
+
+def fmt_svc(key: str, discount: int = 0) -> str:
+    s = SERVICES[key]
+    if discount:
+        orig    = s["amount"]
+        discounted = int(orig * (1 - discount / 100))
+        price_line = f"~~{s['price']}~~ → *{discounted} ₽* (скидка {discount}%)"
+    else:
+        price_line = s["price"]
+    return f"*{s['name']}*\n{s['desc']}\n💫 {price_line}  ·  {s['duration']}"
+
+def payment_msg(service_key: str, discount: int = 0) -> str:
+    s    = SERVICES[service_key]
+    orig = s["amount"]
+    amt  = int(orig * (1 - discount / 100)) if discount else orig
+    disc_line = f"\n🎁 Применена скидка {discount}%: ~~{orig} ₽~~ → *{amt} ₽*" if discount else ""
+    return (
+        f"💳 *Реквизиты для оплаты*\n\n"
+        f"Сумма: *{amt} ₽*{disc_line}\n"
+        f"Банк: {BANK_NAME}\n"
+        f"Номер карты: `{CARD_NUMBER}`\n"
+        f"Получатель: {CARD_NAME}\n\n"
+        "Комментарий к переводу писать не нужно.\n\n"
+        "Заявки обрабатываются в рабочее время. "
+        "Если пришла ночью — подтвержу утром ☽"
+    )
+
+def gen_promo(user_id: int) -> str:
+    code = "LUNA-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    with db() as c:
+        c.execute(
+            "INSERT INTO promo_codes (code, owner_id, discount) VALUES (?,?,?)",
+            (code, user_id, DISCOUNT_PCT)
+        )
+    return code
+
+def use_promo(code: str, user_id: int):
+    """Returns discount % or 0 if invalid/used."""
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM promo_codes WHERE code=? AND used=0", (code,)
+        ).fetchone()
+        if not row:
+            return 0
+        # нельзя использовать свой же промокод
+        if row["owner_id"] == user_id:
+            return -1
+        c.execute(
+            "UPDATE promo_codes SET used=1, used_by=?, used_at=datetime('now') WHERE code=?",
+            (user_id, code)
+        )
+        return row["discount"]
+
+def ensure_user(user):
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?,?,?)",
+            (user.id, user.username or "", user.first_name or "")
+        )
+        c.execute(
+            "UPDATE users SET username=?, first_name=? WHERE user_id=?",
+            (user.username or "", user.first_name or "", user.id)
+        )
+
+def has_consented(user_id: int) -> bool:
+    with db() as c:
+        row = c.execute("SELECT consented FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return bool(row and row["consented"])
+
+def set_consent(user_id: int):
+    with db() as c:
+        c.execute("UPDATE users SET consented=1 WHERE user_id=?", (user_id,))
+
+def open_question_window(user_id: int, order_id: int):
+    expires = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as c:
+        c.execute(
+            "INSERT INTO question_window (user_id, order_id, expires_at) VALUES (?,?,?)",
+            (user_id, order_id, expires)
+        )
+
+admin_id: int | None = None
+
+async def notify_admin(ctx, text: str):
+    global admin_id
+    if admin_id:
+        try:
+            await ctx.bot.send_message(chat_id=admin_id, text=text, parse_mode="Markdown")
+            return
+        except Exception as e:
+            log.warning("Admin notify by ID failed: %s", type(e).__name__)
+    try:
+        await ctx.bot.send_message(chat_id=f"@{ADMIN_UN}", text=text, parse_mode="Markdown")
+    except Exception as e:
+        log.warning("Admin notify by username failed: %s", type(e).__name__)
+
+# ── KEYBOARDS ─────────────────────────────────────────────────────────────────
+def kb_consent():
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("← Назад к услугам", callback_data="back_to_menu")
+        InlineKeyboardButton("✅ Принимаю и продолжаю", callback_data="consent_yes")
     ]])
 
-def confirm_keyboard():
+def kb_services(discount: int = 0):
+    rows = []
+    for k, s in SERVICES.items():
+        label = s["name"]
+        if discount:
+            amt = int(s["amount"] * (1 - discount / 100))
+            label += f"  —  {amt} ₽ (-{discount}%)"
+        else:
+            label += f"  —  {s['price']}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"svc_{k}")])
+    rows.append([InlineKeyboardButton("🎁 Ввести промокод", callback_data="enter_promo")])
+    rows.append([InlineKeyboardButton("❓ Вопрос / проблема", callback_data="support")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_back(discount: int = 0):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("← Назад к услугам", callback_data=f"back_menu_{discount}")
+    ]])
+
+def kb_confirm():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Подтвердить заявку", callback_data="confirm_yes")],
-        [InlineKeyboardButton("← Изменить", callback_data="back_to_menu")],
+        [InlineKeyboardButton("✅ Всё верно, подтвердить", callback_data="confirm_yes")],
+        [InlineKeyboardButton("← Изменить",               callback_data="back_menu_0")],
     ])
 
-def fmt_service(key):
-    s = SERVICES[key]
-    return (
-        f"*{s['name']}*\n"
-        f"{s['desc']}\n"
-        f"💫 {s['price']}  ·  {s['duration']}"
-    )
+def kb_faq():
+    rows = [[InlineKeyboardButton(v[0], callback_data=k)] for k, v in FAQ.items()]
+    rows.append([InlineKeyboardButton("✍️ Написать нам", callback_data="support_write")])
+    rows.append([InlineKeyboardButton("← К услугам",    callback_data="back_menu_0")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_support_cats():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Вопрос об оплате",     callback_data="sup_payment")],
+        [InlineKeyboardButton("📅 Вопрос о расписании",  callback_data="sup_schedule")],
+        [InlineKeyboardButton("⚠️ Техническая проблема", callback_data="sup_tech")],
+        [InlineKeyboardButton("💬 Другое",               callback_data="sup_other")],
+        [InlineKeyboardButton("← Назад к FAQ",           callback_data="support")],
+    ])
 
 # ── /start ────────────────────────────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global admin_id
+    user = update.effective_user
+    ensure_user(user)
+    if is_admin(user) and not admin_id:
+        admin_id = user.id
+
     ctx.user_data.clear()
-    name = update.effective_user.first_name or "дорогой гость"
-    text = (
-        f"Привет, {name} 🌙\n\n"
-        "Я помогу тебе записаться на консультацию по Таро.\n\n"
-        "Каждый расклад — это не просто карты, а разговор о том, "
-        "что действительно происходит внутри и вокруг тебя.\n\n"
-        "Выбери, что тебе сейчас нужно 👇"
-    )
-    await update.message.reply_text(
-        text, reply_markup=service_keyboard(), parse_mode="Markdown"
+
+    if not has_consented(user.id):
+        await update.message.reply_text(
+            f"Привет, {user.first_name or 'дорогой гость'} 🌙\n\n"
+            "Прежде чем начать — одна формальность.\n\n"
+            "Для записи на консультацию бот сохраняет твоё имя и контакт. "
+            "Данные используются только для связи с тобой и не передаются третьим лицам.\n\n"
+            "Нажми «Принимаю» — и перейдём к раскладам ☽",
+            reply_markup=kb_consent()
+        )
+        return CONSENT
+
+    return await show_main_menu(update, ctx)
+
+async def consent_given(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    set_consent(q.from_user.id)
+    await q.edit_message_text(
+        "Отлично 🌙\n\nВыбери, что тебе сейчас нужно 👇",
+        reply_markup=kb_services()
     )
     return CHOOSE_SERVICE
 
-# ── service selected ──────────────────────────────────────────────────────────
-async def service_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    key = q.data.replace("svc_", "")
-    ctx.user_data["service"] = key
-    s = SERVICES[key]
+async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    discount = ctx.user_data.get("discount", 0)
+    text = "Выбери, что тебе сейчас нужно 👇"
+    if discount:
+        text = f"🎁 Промокод активен — скидка {discount}%!\n\n" + text
+    if hasattr(update, "message") and update.message:
+        await update.message.reply_text(text, reply_markup=kb_services(discount), parse_mode="Markdown")
+    return CHOOSE_SERVICE
 
-    text = (
-        f"Ты выбрала:\n\n{fmt_service(key)}\n\n"
-        "Как тебя зовут? (имя, как тебе удобно)"
-    )
-    await q.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
-    return ASK_NAME
+# ── PROMO ─────────────────────────────────────────────────────────────────────
+async def enter_promo_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("Введи свой промокод:")
+    return PROMO_INPUT
 
-# ── FAQ ───────────────────────────────────────────────────────────────────────
-async def show_faq(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    text = (
-        "💬 *Как проходит консультация*\n\n"
-        "Консультации проходят онлайн — голосом или текстом в Telegram, "
-        "как тебе удобнее.\n\n"
-        "Я использую Таро как инструмент глубинного анализа, соединяя "
-        "карты с психологическим пониманием ситуации. Это не классическое предсказание "
-        "будущего — это разговор о твоих паттернах, ресурсах и возможных путях.\n\n"
-        "🕐 *Мини-расклад* — до 15 минут, один конкретный вопрос\n"
-        "🕐 *Большой расклад* — до 60 минут, полная картина\n\n"
-        "После оплаты я напишу тебе лично и согласуем удобное время."
-    )
-    await q.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("← К услугам", callback_data="back_to_menu")
-        ]]),
+async def cmd_promo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Введи свой промокод:")
+    return PROMO_INPUT
+
+async def promo_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    code = update.message.text.strip().upper()
+    uid  = update.effective_user.id
+    result = use_promo(code, uid)
+
+    if result == -1:
+        await update.message.reply_text(
+            "Свой промокод использовать нельзя — он создан для других 🌙\n\n"
+            "/menu — вернуться к услугам"
+        )
+        return CHOOSE_SERVICE
+
+    if result == 0:
+        await update.message.reply_text(
+            "Промокод не найден или уже использован.\n\n"
+            "Проверь код и попробуй ещё раз, или вернись к услугам: /menu"
+        )
+        return PROMO_INPUT
+
+    ctx.user_data["discount"] = result
+    ctx.user_data["promo_code"] = code
+    discount = result
+    await update.message.reply_text(
+        f"✅ Промокод принят! Скидка {discount}% применена.\n\n"
+        "Выбери услугу 👇",
+        reply_markup=kb_services(discount),
         parse_mode="Markdown"
     )
     return CHOOSE_SERVICE
 
-# ── back to menu ──────────────────────────────────────────────────────────────
-async def back_to_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+# ── SERVICE FLOW ──────────────────────────────────────────────────────────────
+async def service_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    key = q.data.replace("svc_", "")
+    discount = ctx.user_data.get("discount", 0)
+    ctx.user_data["service"] = key
     await q.edit_message_text(
-        "Выбери услугу 👇", reply_markup=service_keyboard()
+        f"Ты выбрала:\n\n{fmt_svc(key, discount)}\n\nКак тебя зовут?",
+        reply_markup=kb_back(discount), parse_mode="Markdown"
     )
+    return ASK_NAME
+
+async def back_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    try:
+        discount = int(q.data.split("_")[-1])
+    except Exception:
+        discount = ctx.user_data.get("discount", 0)
+    await q.edit_message_text("Выбери услугу 👇", reply_markup=kb_services(discount))
     return CHOOSE_SERVICE
 
-# ── name received ─────────────────────────────────────────────────────────────
 async def name_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["client_name"] = update.message.text.strip()
-    svc_key = ctx.user_data.get("service", "")
-    s = SERVICES.get(svc_key, {})
-
-    # for yes/no and day readings — no question needed
-    if svc_key in ("yn", "day"):
-        if svc_key == "yn":
-            prompt = "Напиши свой вопрос (на который хочешь ответ Да или Нет):"
-        else:
-            prompt = "Есть ли что-то конкретное, на что ты хочешь обратить внимание сегодня? Или просто напиши «без темы»:"
+    svc = ctx.user_data.get("service", "")
+    if svc == "yn":
+        prompt = "Напиши свой вопрос максимально конкретно — чтобы ответ Да/Нет был точным:"
+    elif svc == "day":
+        prompt = "Есть конкретная тема или фокус для ближайших суток?\nЕсли нет — напиши «без темы»:"
     else:
-        prompt = (
-            f"Расскажи коротко свой вопрос или тему для {s.get('name','расклада')}.\n\n"
-            "Не нужно писать много — пара слов о том, что тебя сейчас занимает:"
-        )
-
+        prompt = "Расскажи коротко — что тебя сейчас занимает?\nПара предложений, без подготовки:"
     await update.message.reply_text(prompt)
     return ASK_QUESTION
 
-# ── question received ─────────────────────────────────────────────────────────
 async def question_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["question"] = update.message.text.strip()
     await update.message.reply_text(
-        "Отлично. Как с тобой связаться? Напиши свой Telegram @username или номер телефона:"
+        "Как с тобой связаться?\nНапиши @username в Telegram или номер телефона:"
     )
     return ASK_CONTACT
 
-# ── contact received ──────────────────────────────────────────────────────────
 async def contact_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["contact"] = update.message.text.strip()
+    d        = ctx.user_data
+    s        = SERVICES[d["service"]]
+    discount = d.get("discount", 0)
+    amt      = int(s["amount"] * (1 - discount / 100)) if discount else s["amount"]
+    disc_line = f"🎁 Скидка: {discount}% → {amt} ₽\n" if discount else ""
 
-    d  = ctx.user_data
-    s  = SERVICES[d["service"]]
-    summary = (
-        f"*Проверь свою заявку:*\n\n"
+    await update.message.reply_text(
+        f"*Проверь заявку:*\n\n"
         f"👤 Имя: {d['client_name']}\n"
         f"✨ Услуга: {s['name']}\n"
         f"💫 Стоимость: {s['price']}\n"
-        f"⏱ Формат: {s['duration']}\n"
+        f"{disc_line}"
         f"💬 Вопрос/тема: {d['question']}\n"
         f"📲 Контакт: {d['contact']}\n\n"
-        "Всё верно?"
-    )
-    await update.message.reply_text(
-        summary, reply_markup=confirm_keyboard(), parse_mode="Markdown"
+        "Всё верно?",
+        reply_markup=kb_confirm(), parse_mode="Markdown"
     )
     return CONFIRM
 
-# ── confirmation ──────────────────────────────────────────────────────────────
 async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    d = ctx.user_data
-    s = SERVICES[d["service"]]
+    q    = update.callback_query; await q.answer()
+    d    = ctx.user_data
+    s    = SERVICES[d["service"]]
     user = update.effective_user
+    discount = d.get("discount", 0)
+    now  = datetime.now().strftime("%d.%m %H:%M")
 
-    # notify admin
-    admin_text = (
-        f"🔔 *Новая заявка на расклад*\n\n"
-        f"👤 Имя: {d['client_name']}\n"
-        f"✨ Услуга: {s['name']} — {s['price']}\n"
-        f"⏱ Формат: {s['duration']}\n"
-        f"💬 Вопрос: {d['question']}\n"
-        f"📲 Контакт: {d['contact']}\n"
-        f"🆔 Telegram ID: {user.id}"
-        + (f"\n🔗 Username: @{user.username}" if user.username else "")
-    )
-    try:
-        await ctx.bot.send_message(
-            chat_id=8288323625,
-            text=admin_text,
-            parse_mode="Markdown"
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO orders (user_id, service, question, contact) VALUES (?,?,?,?)",
+            (user.id, d["service"], d["question"], d["contact"])
         )
-    except Exception as e:
-        log.warning(f"Could not notify admin by username, trying direct: {e}")
-        # admin will still get it when they /start the bot
+        order_id = cur.lastrowid
 
-    # confirm to user
+    flag     = "🔴 СРОЧНО\n" if d["service"] == "day" else ""
+    disc_adm = f"\n🎁 Промокод: скидка {discount}%" if discount else ""
+    amt      = int(s["amount"] * (1 - discount / 100)) if discount else s["amount"]
+
+    admin_text = (
+        f"🔔 {flag}*Новая заявка*  |  {now}\n\n"
+        f"👤 {d['client_name']}"
+        + (f"  @{user.username}" if user.username else "") +
+        f"  |  ID: `{user.id}`\n"
+        f"✨ {s['name']} — {amt} ₽{disc_adm}\n"
+        f"⏱ {s['duration']}\n"
+        f"💬 {d['question']}\n"
+        f"📲 {d['contact']}\n\n"
+        f"✅ `/paid {user.id}`"
+    )
+    await notify_admin(ctx, admin_text)
+
     await q.edit_message_text(
-        f"✨ Заявка принята!\n\n"
-        f"Я свяжусь с тобой в ближайшее время и пришлю реквизиты для оплаты. "
-        f"После подтверждения оплаты согласуем удобное время для сессии.\n\n",
+        f"✨ *Заявка принята!*\n\n{payment_msg(d['service'], discount)}",
         parse_mode="Markdown"
     )
     ctx.user_data.clear()
     return ConversationHandler.END
 
-# ── /menu ─────────────────────────────────────────────────────────────────────
-async def menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
-    await update.message.reply_text(
-        "Выбери услугу 👇", reply_markup=service_keyboard()
+# ── SUPPORT FLOW ──────────────────────────────────────────────────────────────
+async def show_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "💬 *Частые вопросы*\n\nВыбери тему — отвечу сразу:",
+        reply_markup=kb_faq(), parse_mode="Markdown"
     )
     return CHOOSE_SERVICE
 
-# ── /cancel ───────────────────────────────────────────────────────────────────
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
-    await update.message.reply_text(
-        "Хорошо, отменила 🌙 Напиши /start когда будешь готова.",
-        reply_markup=ReplyKeyboardRemove()
+async def show_faq_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    title, answer = FAQ[q.data]
+    await q.edit_message_text(
+        f"*{title}*\n\n{answer}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("← Назад к FAQ", callback_data="support")],
+            [InlineKeyboardButton("← К услугам",   callback_data="back_menu_0")],
+        ]),
+        parse_mode="Markdown"
     )
+    return CHOOSE_SERVICE
+
+async def support_write(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("Выбери категорию:", reply_markup=kb_support_cats())
+    return SUPPORT_CHOOSE
+
+async def support_cat_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    cat_map = {
+        "sup_payment":  "💳 Вопрос об оплате",
+        "sup_schedule": "📅 Вопрос о расписании",
+        "sup_tech":     "⚠️ Техническая проблема",
+        "sup_other":    "💬 Другое",
+    }
+    ctx.user_data["sup_cat"] = cat_map.get(q.data, "Другое")
+    await q.edit_message_text(
+        f"Категория: *{ctx.user_data['sup_cat']}*\n\nНапиши своё сообщение:",
+        parse_mode="Markdown"
+    )
+    return SUPPORT_MESSAGE
+
+async def support_msg_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg  = update.message.text.strip()
+    cat  = ctx.user_data.get("sup_cat", "Другое")
+
+    with db() as c:
+        cur = c.execute(
+            "INSERT INTO support_tickets (user_id, username, first_name, category, message) VALUES (?,?,?,?,?)",
+            (user.id, user.username or "", user.first_name or "", cat, msg)
+        )
+        tid = cur.lastrowid
+
+    await notify_admin(ctx,
+        f"📩 *Обращение #{tid}*\n\n"
+        f"Категория: {cat}\n"
+        f"👤 {user.first_name or ''}"
+        + (f" @{user.username}" if user.username else "") +
+        f"  ID: `{user.id}`\n\n"
+        f"{msg}\n\n"
+        f"`/reply {user.id} текст`"
+    )
+    await update.message.reply_text(
+        f"✅ Обращение #{tid} принято.\nОтвечу в рабочее время ☽\n\n/start — главное меню"
+    )
+    ctx.user_data.clear()
     return ConversationHandler.END
 
-# ── fallback ──────────────────────────────────────────────────────────────────
-async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
+async def cmd_clients(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    with db() as c:
+        rows = c.execute(
+            "SELECT o.*, u.username, u.first_name FROM orders o "
+            "JOIN users u ON o.user_id=u.user_id "
+            "WHERE o.status='awaiting_payment' "
+            "ORDER BY CASE o.service WHEN 'day' THEN 0 ELSE 1 END, o.ordered_at"
+        ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Очередь пуста.")
+        return
+
+    lines = ["📋 *Очередь заявок:*\n"]
+    for r in rows:
+        s    = SERVICES[r["service"]]
+        flag = "🔴 " if r["service"] == "day" else "⬜ "
+        lines.append(
+            f"{flag}*{s['name']}* — {s['price']}\n"
+            f"  👤 {r['first_name']}"
+            + (f" @{r['username']}" if r['username'] else "") +
+            f"  ID: `{r['user_id']}`\n"
+            f"  🕐 {r['ordered_at']}\n"
+            f"  💬 {r['question'][:60]}{'…' if len(r['question'])>60 else ''}\n"
+            f"  `/paid {r['user_id']}`\n"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /paid <user_id>")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status='awaiting_payment' "
+            "ORDER BY ordered_at DESC LIMIT 1", (uid,)
+        ).fetchone()
+        if not row:
+            await update.message.reply_text(f"❗ Заявка для {uid} не найдена.")
+            return
+        order_id = row["id"]
+        svc      = row["service"]
+        c.execute(
+            "UPDATE orders SET status='confirmed', paid_at=datetime('now') WHERE id=?",
+            (order_id,)
+        )
+
+    content = PAID_CONTENT[svc]
+    if svc == "full":
+        content += FULL_BONUSES
+        open_question_window(uid, order_id)
+        promo = gen_promo(uid)
+
+    try:
+        await ctx.bot.send_message(chat_id=uid, text=content, parse_mode="Markdown")
+        if svc == "full":
+            await ctx.bot.send_message(
+                chat_id=uid,
+                text=f"🎁 Твой промокод на скидку {DISCOUNT_PCT}%:\n\n`{promo}`\n\n"
+                     "Можешь использовать сам или передать другу — промокод одноразовый ☽",
+                parse_mode="Markdown"
+            )
+        s = SERVICES[svc]
+        await update.message.reply_text(
+            f"✅ Оплата подтверждена\n"
+            f"👤 ID {uid} — {s['name']}\n"
+            + (f"📩 Открыто окно уточняющего вопроса (24ч)\n🎁 Промокод: {promo}" if svc == "full" else "")
+        )
+        log.info("Payment confirmed uid=%s service=%s order=%s", uid, svc, order_id)
+    except Exception as e:
+        with db() as c:
+            c.execute("UPDATE orders SET status='awaiting_payment', paid_at=NULL WHERE id=?", (order_id,))
+        await update.message.reply_text(
+            f"⚠️ Не удалось отправить сообщение клиенту. Ошибка: {type(e).__name__}\n"
+            "Заявка возвращена в очередь."
+        )
+
+async def cmd_cancel_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    if not ctx.args:
+        await update.message.reply_text("Использование: /cancel_pay <user_id>")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+
+    with db() as c:
+        row = c.execute(
+            "SELECT id FROM orders WHERE user_id=? AND status='awaiting_payment' "
+            "ORDER BY ordered_at DESC LIMIT 1", (uid,)
+        ).fetchone()
+        if not row:
+            await update.message.reply_text("Заявка не найдена.")
+            return
+        c.execute("UPDATE orders SET status='cancelled' WHERE id=?", (row["id"],))
+
+    await update.message.reply_text(f"🗑 Заявка ID {uid} отменена.")
+    try:
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text="🌙 Оплата по заявке не подтверждена.\n\n"
+                 "Если произошла ошибка — напиши через меню «Вопрос / проблема».\n"
+                 "/start — начать заново."
+        )
+    except Exception:
+        pass
+
+async def cmd_questions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    with db() as c:
+        rows = c.execute(
+            "SELECT qw.*, u.username, u.first_name FROM question_window qw "
+            "JOIN users u ON qw.user_id=u.user_id "
+            "WHERE qw.used=0 AND qw.expires_at > datetime('now') "
+            "ORDER BY qw.expires_at"
+        ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Нет активных окон уточняющего вопроса.")
+        return
+
+    lines = ["📋 *Клиенты с правом на уточняющий вопрос:*\n"]
+    for r in rows:
+        status = "⏳ ждёт вопроса" if not r["question"] else f"❓ Вопрос: {r['question'][:50]}"
+        lines.append(
+            f"👤 {r['first_name']}"
+            + (f" @{r['username']}" if r['username'] else "") +
+            f"  ID: `{r['user_id']}`\n"
+            f"  ⏰ До: {r['expires_at'][:16]}\n"
+            f"  {status}\n"
+            + (f"  `/answer {r['user_id']} текст`\n" if r["question"] and not r["answered"] else "")
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text("Использование: /answer <user_id> <текст>")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+
+    answer = " ".join(ctx.args[1:])
+    with db() as c:
+        c.execute(
+            "UPDATE question_window SET answered=1 WHERE user_id=? AND used=1",
+            (uid,)
+        )
+    try:
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text=f"🌙 *Ответ на твой вопрос:*\n\n{answer}\n\n☽",
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text(f"✅ Ответ отправлен клиенту {uid}.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка: {type(e).__name__}")
+
+async def cmd_promos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    with db() as c:
+        rows = c.execute(
+            "SELECT p.*, u.first_name, u.username FROM promo_codes p "
+            "JOIN users u ON p.owner_id=u.user_id "
+            "ORDER BY p.created_at DESC LIMIT 30"
+        ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Промокодов нет.")
+        return
+
+    lines = ["🎁 *Промокоды:*\n"]
+    for r in rows:
+        status = "✅ активен" if not r["used"] else f"❌ использован"
+        lines.append(
+            f"`{r['code']}` — {r['discount']}% — {status}\n"
+            f"  Выдан: {r['first_name']}"
+            + (f" @{r['username']}" if r['username'] else "") + "\n"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_support_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM support_tickets WHERE resolved=0 ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Новых обращений нет.")
+        return
+
+    lines = ["📩 *Обращения:*\n"]
+    for r in rows:
+        lines.append(
+            f"#{r['id']} · {r['category']}\n"
+            f"  👤 {r['first_name']}"
+            + (f" @{r['username']}" if r['username'] else "") +
+            f"  ID: `{r['user_id']}`\n"
+            f"  {r['message'][:80]}{'…' if len(r['message'])>80 else ''}\n"
+            f"  `/reply {r['user_id']} текст`\n"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text("Использование: /reply <user_id> <текст>")
+        return
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+
+    text = " ".join(ctx.args[1:])
+    with db() as c:
+        c.execute(
+            "UPDATE support_tickets SET resolved=1 WHERE user_id=? AND resolved=0",
+            (uid,)
+        )
+    try:
+        await ctx.bot.send_message(
+            chat_id=uid,
+            text=f"💬 *Ответ на твоё обращение:*\n\n{text}\n\n☽",
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text(f"✅ Ответ отправлен {uid}.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Ошибка: {type(e).__name__}")
+
+# ── /ask — клиентская команда для уточняющего вопроса ────────────────────────
+async def cmd_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM question_window WHERE user_id=? AND used=0 "
+            "AND expires_at > datetime('now') LIMIT 1", (uid,)
+        ).fetchone()
+
+    if not row:
+        await update.message.reply_text(
+            "У тебя нет активного права на уточняющий вопрос.\n\n"
+            "Оно появляется после оплаты большого расклада и действует 24 часа. ☽"
+        )
+        return
+
     await update.message.reply_text(
-        "Напиши /start чтобы начать заново, или /menu чтобы выбрать услугу."
+        "Напиши свой уточняющий вопрос по итогам нашей сессии.\n\n"
+        f"⏰ Окно закрывается: {row['expires_at'][:16]}"
+    )
+    ctx.user_data["awaiting_ask"] = row["id"]
+
+async def ask_question_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if "awaiting_ask" not in ctx.user_data:
+        return
+    window_id = ctx.user_data.pop("awaiting_ask")
+    uid  = update.effective_user.id
+    text = update.message.text.strip()
+
+    with db() as c:
+        c.execute(
+            "UPDATE question_window SET used=1, asked_at=datetime('now'), question=? WHERE id=?",
+            (text, window_id)
+        )
+
+    await notify_admin(None,  # нельзя использовать ctx здесь напрямую
+        f"❓ *Уточняющий вопрос*\n\nID: `{uid}`\n\n{text}\n\n`/answer {uid} текст`"
+    )
+    await update.message.reply_text(
+        "✅ Вопрос отправлен. Отвечу в рабочее время ☽"
     )
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── /menu, /cancel ────────────────────────────────────────────────────────────
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("Выбери услугу 👇", reply_markup=kb_services())
+    return CHOOSE_SERVICE
+
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("Хорошо 🌙 /start — главное меню.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if ctx.user_data.get("awaiting_ask"):
+        await ask_question_received(update, ctx)
+        return
+    await update.message.reply_text("/start — главное меню  |  /menu — услуги")
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    keep_alive()
+    init_db()
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("menu", menu),
+            CommandHandler("start", cmd_start),
+            CommandHandler("menu",  cmd_menu),
+            CommandHandler("promo", cmd_promo),
         ],
         states={
+            CONSENT: [
+                CallbackQueryHandler(consent_given, pattern="^consent_yes$"),
+            ],
             CHOOSE_SERVICE: [
-                CallbackQueryHandler(service_chosen, pattern="^svc_"),
-                CallbackQueryHandler(show_faq,       pattern="^faq$"),
-                CallbackQueryHandler(back_to_menu,   pattern="^back_to_menu$"),
+                CallbackQueryHandler(service_chosen,  pattern="^svc_"),
+                CallbackQueryHandler(show_support,    pattern="^support$"),
+                CallbackQueryHandler(show_faq_answer, pattern="^faq_"),
+                CallbackQueryHandler(support_write,   pattern="^support_write$"),
+                CallbackQueryHandler(back_menu,       pattern="^back_menu_"),
+                CallbackQueryHandler(enter_promo_cb,  pattern="^enter_promo$"),
+            ],
+            PROMO_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_received),
             ],
             ASK_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, name_received),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
+                CallbackQueryHandler(back_menu, pattern="^back_menu_"),
             ],
             ASK_QUESTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, question_received),
@@ -286,20 +919,38 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, contact_received),
             ],
             CONFIRM: [
-                CallbackQueryHandler(confirmed,    pattern="^confirm_yes$"),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
+                CallbackQueryHandler(confirmed, pattern="^confirm_yes$"),
+                CallbackQueryHandler(back_menu, pattern="^back_menu_"),
+            ],
+            SUPPORT_CHOOSE: [
+                CallbackQueryHandler(support_cat_chosen, pattern="^sup_"),
+                CallbackQueryHandler(show_support,       pattern="^support$"),
+                CallbackQueryHandler(back_menu,          pattern="^back_menu_"),
+            ],
+            SUPPORT_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, support_msg_received),
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("start",  start),
+            CommandHandler("cancel", cmd_cancel),
+            CommandHandler("start",  cmd_start),
             MessageHandler(filters.TEXT & ~filters.COMMAND, fallback),
         ],
         allow_reentry=True,
     )
 
     app.add_handler(conv)
-    log.info("Bot started ✨")
+    app.add_handler(CommandHandler("clients",      cmd_clients))
+    app.add_handler(CommandHandler("paid",         cmd_paid))
+    app.add_handler(CommandHandler("cancel_pay",   cmd_cancel_pay))
+    app.add_handler(CommandHandler("questions",    cmd_questions))
+    app.add_handler(CommandHandler("answer",       cmd_answer))
+    app.add_handler(CommandHandler("promos",       cmd_promos))
+    app.add_handler(CommandHandler("support_list", cmd_support_list))
+    app.add_handler(CommandHandler("reply",        cmd_reply))
+    app.add_handler(CommandHandler("ask",          cmd_ask))
+
+    log.info("Bot started")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

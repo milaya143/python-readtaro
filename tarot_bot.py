@@ -3,7 +3,7 @@
 Tarot Bot — final production version
 ═══════════════════════════════════════════════════════════
 Переменные окружения (Render → Environment):
-  TELEGRAM_TOKEN      токен от @BotFather
+  BOT_TOKEN      токен от @BotFather
   ADMIN_UN       username без @
   CARD_NUMBER    номер карты
   CARD_NAME      имя на карте латиницей
@@ -21,7 +21,8 @@ Tarot Bot — final production version
 ═══════════════════════════════════════════════════════════
 """
 
-import os, logging, random, string, sqlite3
+import os, logging, random, string, sqlite3, threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -31,11 +32,13 @@ from telegram.ext import (
 )
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
-TOKEN       = os.environ["TELEGRAM_TOKEN"]
+TOKEN       = os.environ["BOT_TOKEN"]
 ADMIN_UN    = os.environ["ADMIN_UN"].lstrip("@")
 CARD_NUMBER = os.environ["CARD_NUMBER"]
 CARD_NAME   = os.environ["CARD_NAME"]
 BANK_NAME   = os.environ["BANK_NAME"]
+SBP_PHONE   = os.environ["SBP_PHONE"]      # номер телефона для СБП
+SBP_BANK    = os.environ.get("SBP_BANK", "") # банк получателя СБП (необязательно)
 DISCOUNT_PCT = 20
 DB_PATH     = "tarot.db"
 
@@ -116,15 +119,16 @@ def init_db():
 # ── STATES ────────────────────────────────────────────────────────────────────
 (CONSENT,
  CHOOSE_SERVICE, ASK_NAME, ASK_QUESTION, ASK_CONTACT, CONFIRM,
+ CHOOSE_PAYMENT,
  SUPPORT_CHOOSE, SUPPORT_MESSAGE,
- PROMO_INPUT) = range(9)
+ PROMO_INPUT) = range(10)
 
 # ── SERVICES ──────────────────────────────────────────────────────────────────
 SERVICES = {
-    "yn":   {"name": "Расклад Да/Нет",        "desc": "2 карты · быстрый ответ на конкретный вопрос",     "price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 2},
-    "day":  {"name": "Расклад на день",        "desc": "2 карты · энергия и ключевая тема ближайших суток","price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 1},
-    "mini": {"name": "Мини-расклад на вопрос", "desc": "Отношения / деньги / любая тема · глубокий ответ", "price": "3 000 ₽", "amount": 3000, "duration": "согласуем время",   "priority": 2},
-    "full": {"name": "Большой расклад",        "desc": "Полная сессия · комплексный анализ ситуации",      "price": "5 000 ₽", "amount": 5000, "duration": "согласуем время",   "priority": 3},
+    "yn":   {"name": "Расклад Да/Нет",        "desc": "2 карты · быстрый ответ на конкретный вопрос",     "price": "490 ₽",   "amount": 490,  "duration": "в порядке очереди", "priority": 2},
+    "day":  {"name": "Расклад на день",        "desc": "2 карты · энергия и ключевая тема ближайших суток","price": "490 ₽",   "amount": 490,  "duration": "в порядке очереди", "priority": 1},
+    "mini": {"name": "Мини-расклад на вопрос", "desc": "Отношения / деньги / любая тема · глубокий ответ", "price": "2 990 ₽", "amount": 2 990, "duration": "согласуем время",   "priority": 2},
+    "full": {"name": "Большой расклад",        "desc": "Полная сессия · комплексный анализ ситуации",      "price": "5 500 ₽", "amount": 5500, "duration": "согласуем время",   "priority": 3},
 }
 
 FAQ = {
@@ -133,8 +137,10 @@ FAQ = {
                    "Я соединяю Таро с психологическим анализом. Это не предсказание будущего — "
                    "это разговор о твоих паттернах, ресурсах и возможных путях."),
     "faq_pay":    ("Как оплатить?",
-                   "После подтверждения заявки бот пришлёт реквизиты карты. "
-                   "Обычный банковский перевод, комментарий писать не нужно. "
+                   "После подтверждения заявки бот предложит выбрать способ оплаты:\n\n"
+                   "💳 *Картой* — перевод на номер карты\n"
+                   "📱 *СБП* — перевод по номеру телефона через Систему быстрых платежей\n\n"
+                   "Комментарий к переводу писать не нужно. "
                    "Я подтверждаю оплату вручную и присылаю всё необходимое."),
     "faq_time":   ("Когда получу расклад?",
                    "Заявки обрабатываются в рабочее время. "
@@ -197,18 +203,35 @@ def fmt_svc(key: str, discount: int = 0) -> str:
         price_line = s["price"]
     return f"*{s['name']}*\n{s['desc']}\n💫 {price_line}  ·  {s['duration']}"
 
-def payment_msg(service_key: str, discount: int = 0) -> str:
+def payment_msg_card(service_key: str, discount: int = 0) -> str:
     s    = SERVICES[service_key]
     orig = s["amount"]
     amt  = int(orig * (1 - discount / 100)) if discount else orig
-    disc_line = f"\n🎁 Применена скидка {discount}%: ~~{orig} ₽~~ → *{amt} ₽*" if discount else ""
+    disc_line = f"\n🎁 Скидка {discount}%: ~~{orig} ₽~~ → *{amt} ₽*" if discount else ""
     return (
-        f"💳 *Реквизиты для оплаты*\n\n"
+        f"💳 *Оплата картой*\n\n"
         f"Сумма: *{amt} ₽*{disc_line}\n"
         f"Банк: {BANK_NAME}\n"
         f"Номер карты: `{CARD_NUMBER}`\n"
         f"Получатель: {CARD_NAME}\n\n"
         "Комментарий к переводу писать не нужно.\n\n"
+        "Заявки обрабатываются в рабочее время. "
+        "Если пришла ночью — подтвержу утром ☽"
+    )
+
+def payment_msg_sbp(service_key: str, discount: int = 0) -> str:
+    s    = SERVICES[service_key]
+    orig = s["amount"]
+    amt  = int(orig * (1 - discount / 100)) if discount else orig
+    disc_line = f"\n🎁 Скидка {discount}%: ~~{orig} ₽~~ → *{amt} ₽*" if discount else ""
+    bank_line = f"\nБанк получателя: {SBP_BANK}" if SBP_BANK else ""
+    return (
+        f"📱 *Оплата через СБП*\n\n"
+        f"Сумма: *{amt} ₽*{disc_line}\n"
+        f"Номер телефона: `{SBP_PHONE}`{bank_line}\n"
+        f"Получатель: {CARD_NAME}\n\n"
+        "Открой приложение своего банка → СБП → введи номер телефона.\n"
+        "Комментарий писать не нужно.\n\n"
         "Заявки обрабатываются в рабочее время. "
         "Если пришла ночью — подтвержу утром ☽"
     )
@@ -311,6 +334,13 @@ def kb_confirm():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Всё верно, подтвердить", callback_data="confirm_yes")],
         [InlineKeyboardButton("← Изменить",               callback_data="back_menu_0")],
+    ])
+
+def kb_payment_method():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Картой",      callback_data="pay_card")],
+        [InlineKeyboardButton("📱 СБП",         callback_data="pay_sbp")],
+        [InlineKeyboardButton("← Назад",        callback_data="back_menu_0")],
     ])
 
 def kb_faq():
@@ -472,11 +502,21 @@ async def contact_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query; await q.answer()
-    d    = ctx.user_data
-    s    = SERVICES[d["service"]]
-    user = update.effective_user
+    # просто показываем выбор способа оплаты
+    await q.edit_message_text(
+        "Отлично! Выбери удобный способ оплаты 👇",
+        reply_markup=kb_payment_method()
+    )
+    return CHOOSE_PAYMENT
+
+async def payment_method_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q        = update.callback_query; await q.answer()
+    method   = q.data  # "pay_card" or "pay_sbp"
+    d        = ctx.user_data
+    s        = SERVICES[d["service"]]
+    user     = update.effective_user
     discount = d.get("discount", 0)
-    now  = datetime.now().strftime("%d.%m %H:%M")
+    now      = datetime.now().strftime("%d.%m %H:%M")
 
     with db() as c:
         cur = c.execute(
@@ -488,6 +528,7 @@ async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     flag     = "🔴 СРОЧНО\n" if d["service"] == "day" else ""
     disc_adm = f"\n🎁 Промокод: скидка {discount}%" if discount else ""
     amt      = int(s["amount"] * (1 - discount / 100)) if discount else s["amount"]
+    pay_icon = "💳" if method == "pay_card" else "📱 СБП"
 
     admin_text = (
         f"🔔 {flag}*Новая заявка*  |  {now}\n\n"
@@ -495,6 +536,7 @@ async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + (f"  @{user.username}" if user.username else "") +
         f"  |  ID: `{user.id}`\n"
         f"✨ {s['name']} — {amt} ₽{disc_adm}\n"
+        f"💰 Способ оплаты: {pay_icon}\n"
         f"⏱ {s['duration']}\n"
         f"💬 {d['question']}\n"
         f"📲 {d['contact']}\n\n"
@@ -502,8 +544,13 @@ async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await notify_admin(ctx, admin_text)
 
+    if method == "pay_card":
+        pay_text = payment_msg_card(d["service"], discount)
+    else:
+        pay_text = payment_msg_sbp(d["service"], discount)
+
     await q.edit_message_text(
-        f"✨ *Заявка принята!*\n\n{payment_msg(d['service'], discount)}",
+        f"✨ *Заявка принята!*\n\n{pay_text}",
         parse_mode="Markdown"
     )
     ctx.user_data.clear()
@@ -882,9 +929,30 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("/start — главное меню  |  /menu — услуги")
 
+# ── HEALTH CHECK SERVER (нужен для Render Web Service) ───────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *args):
+        pass  # заглушаем логи каждого запроса
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info("Health server on port %s", port)
+    server.serve_forever()
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
     init_db()
+
+    # Запускаем health-check сервер в фоне — Render требует открытый порт
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
@@ -921,6 +989,10 @@ def main():
             CONFIRM: [
                 CallbackQueryHandler(confirmed, pattern="^confirm_yes$"),
                 CallbackQueryHandler(back_menu, pattern="^back_menu_"),
+            ],
+            CHOOSE_PAYMENT: [
+                CallbackQueryHandler(payment_method_chosen, pattern="^pay_(card|sbp)$"),
+                CallbackQueryHandler(back_menu,             pattern="^back_menu_"),
             ],
             SUPPORT_CHOOSE: [
                 CallbackQueryHandler(support_cat_chosen, pattern="^sup_"),

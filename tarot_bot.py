@@ -253,9 +253,6 @@ def use_promo(code: str, user_id: int):
         ).fetchone()
         if not row:
             return 0
-        # нельзя использовать свой же промокод
-        if row["owner_id"] == user_id:
-            return -1
         c.execute(
             "UPDATE promo_codes SET used=1, used_by=?, used_at=datetime('now') WHERE code=?",
             (user_id, code)
@@ -367,28 +364,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         admin_id = user.id
 
     ctx.user_data.clear()
-
-    if not has_consented(user.id):
-        await update.message.reply_text(
-            f"Привет, {user.first_name or 'дорогой гость'} 🌙\n\n"
-            "Прежде чем начать — одна формальность.\n\n"
-            "Для записи на консультацию бот сохраняет твоё имя и контакт. "
-            "Данные используются только для связи с тобой и не передаются третьим лицам.\n\n"
-            "Нажми «Принимаю» — и перейдём к раскладам ☽",
-            reply_markup=kb_consent()
-        )
-        return CONSENT
-
     return await show_main_menu(update, ctx)
-
-async def consent_given(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    set_consent(q.from_user.id)
-    await q.edit_message_text(
-        "Отлично 🌙\n\nВыбери, что тебе сейчас нужно 👇",
-        reply_markup=kb_services()
-    )
-    return CHOOSE_SERVICE
 
 async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     discount = ctx.user_data.get("discount", 0)
@@ -413,13 +389,6 @@ async def promo_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip().upper()
     uid  = update.effective_user.id
     result = use_promo(code, uid)
-
-    if result == -1:
-        await update.message.reply_text(
-            "Свой промокод использовать нельзя — он создан для других 🌙\n\n"
-            "/menu — вернуться к услугам"
-        )
-        return CHOOSE_SERVICE
 
     if result == 0:
         await update.message.reply_text(
@@ -495,14 +464,17 @@ async def contact_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{disc_line}"
         f"💬 Вопрос/тема: {d['question']}\n"
         f"📲 Контакт: {d['contact']}\n\n"
-        "Всё верно?",
+        "Всё верно?\n\n"
+        "_Нажимая «Подтвердить», ты соглашаешься на хранение имени и контакта "
+        "для связи по этой заявке._",
         reply_markup=kb_confirm(), parse_mode="Markdown"
     )
     return CONFIRM
 
 async def confirmed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query; await q.answer()
-    # просто показываем выбор способа оплаты
+    # фиксируем согласие в момент подтверждения заявки
+    set_consent(q.from_user.id)
     await q.edit_message_text(
         "Отлично! Выбери удобный способ оплаты 👇",
         reply_markup=kb_payment_method()
@@ -962,9 +934,6 @@ def main():
             CommandHandler("promo", cmd_promo),
         ],
         states={
-            CONSENT: [
-                CallbackQueryHandler(consent_given, pattern="^consent_yes$"),
-            ],
             CHOOSE_SERVICE: [
                 CallbackQueryHandler(service_chosen,  pattern="^svc_"),
                 CallbackQueryHandler(show_support,    pattern="^support$"),

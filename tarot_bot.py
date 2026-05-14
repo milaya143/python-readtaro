@@ -143,10 +143,10 @@ def init_db():
 
 # ── SERVICES ──────────────────────────────────────────────────────────────────
 SERVICES = {
-    "yn":   {"name": "Расклад Да/Нет",        "desc": "2 карты · быстрый ответ на конкретный вопрос",     "price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 2},
-    "day":  {"name": "Расклад на день",        "desc": "2 карты · энергия и ключевая тема ближайших суток","price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 1},
-    "mini": {"name": "Мини-расклад на вопрос", "desc": "Отношения / деньги / любая тема · глубокий ответ", "price": "3 000 ₽", "amount": 3000, "duration": "согласуем время",   "priority": 2},
-    "full": {"name": "Большой расклад",        "desc": "Полная сессия · комплексный анализ ситуации",      "price": "5 000 ₽", "amount": 5000, "duration": "согласуем время",   "priority": 3},
+    "yn":   {"name": "Расклад Да/Нет",        "desc": "2 карты · быстрый ответ на конкретный вопрос",     "price": "490 ₽",   "amount": 490,  "duration": "в порядке очереди", "priority": 2},
+    "day":  {"name": "Расклад на день",        "desc": "2 карты · энергия и ключевая тема ближайших суток","price": "490 ₽",   "amount": 490,  "duration": "в порядке очереди", "priority": 1},
+    "mini": {"name": "Мини-расклад на вопрос", "desc": "Отношения / деньги / любая тема · глубокий ответ", "price": "2 990 ₽", "amount": 2990, "duration": "согласуем время",   "priority": 2},
+    "full": {"name": "Большой расклад",        "desc": "Полная сессия · комплексный анализ ситуации",      "price": "5 500 ₽", "amount": 5500, "duration": "согласуем время",   "priority": 3},
 }
 
 FAQ = {
@@ -1227,7 +1227,7 @@ def main():
                 CallbackQueryHandler(back_menu,          pattern="^back_menu_"),
             ],
             SUPPORT_MESSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, support_msg_received),
+                MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, support_msg_received),
             ],
         },
         fallbacks=[

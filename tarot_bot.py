@@ -34,11 +34,12 @@ from telegram.ext import (
 # ── ENV ───────────────────────────────────────────────────────────────────────
 TOKEN       = os.environ["BOT_TOKEN"]
 ADMIN_UN    = os.environ["ADMIN_UN"].lstrip("@")
+CONTACT_UN  = os.environ["CONTACT_UN"].lstrip("@")  # контакт для мини/фулл раскладов
 CARD_NUMBER = os.environ["CARD_NUMBER"]
 CARD_NAME   = os.environ["CARD_NAME"]
 BANK_NAME   = os.environ["BANK_NAME"]
-SBP_PHONE   = os.environ["SBP_PHONE"]      # номер телефона для СБП
-SBP_BANK    = os.environ.get("SBP_BANK", "") # банк получателя СБП (необязательно)
+SBP_PHONE   = os.environ["SBP_PHONE"]
+SBP_BANK    = os.environ.get("SBP_BANK", "")
 DISCOUNT_PCT = 20
 DB_PATH     = "tarot.db"
 
@@ -113,6 +114,23 @@ def init_db():
             created_at  TEXT DEFAULT (datetime('now')),
             resolved    INTEGER DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS client_replies (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            order_id    INTEGER,
+            message     TEXT NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now')),
+            answered    INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS send_sessions (
+            admin_id    INTEGER PRIMARY KEY,
+            target_uid  INTEGER NOT NULL,
+            target_name TEXT DEFAULT '',
+            order_id    INTEGER,
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
         """)
     log.info("Database ready")
 
@@ -125,10 +143,10 @@ def init_db():
 
 # ── SERVICES ──────────────────────────────────────────────────────────────────
 SERVICES = {
-    "yn":   {"name": "Расклад Да/Нет",        "desc": "2 карты · быстрый ответ на конкретный вопрос",     "price": "490 ₽",   "amount": 490,  "duration": "в порядке очереди", "priority": 2},
-    "day":  {"name": "Расклад на день",        "desc": "2 карты · энергия и ключевая тема ближайших суток","price": "490 ₽",   "amount": 490,  "duration": "в порядке очереди", "priority": 1},
-    "mini": {"name": "Мини-расклад на вопрос", "desc": "Отношения / деньги / любая тема · глубокий ответ", "price": "2 990 ₽", "amount": 2990, "duration": "согласуем время",   "priority": 2},
-    "full": {"name": "Большой расклад",        "desc": "Полная сессия · комплексный анализ ситуации",      "price": "5 500 ₽", "amount": 5500, "duration": "согласуем время",   "priority": 3},
+    "yn":   {"name": "Расклад Да/Нет",        "desc": "2 карты · быстрый ответ на конкретный вопрос",     "price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 2},
+    "day":  {"name": "Расклад на день",        "desc": "2 карты · энергия и ключевая тема ближайших суток","price": "500 ₽",   "amount": 500,  "duration": "в порядке очереди", "priority": 1},
+    "mini": {"name": "Мини-расклад на вопрос", "desc": "Отношения / деньги / любая тема · глубокий ответ", "price": "3 000 ₽", "amount": 3000, "duration": "согласуем время",   "priority": 2},
+    "full": {"name": "Большой расклад",        "desc": "Полная сессия · комплексный анализ ситуации",      "price": "5 000 ₽", "amount": 5000, "duration": "согласуем время",   "priority": 3},
 }
 
 FAQ = {
@@ -160,24 +178,26 @@ PAID_CONTENT = {
     "yn": (
         "🌙 *Оплата подтверждена — расклад Да/Нет*\n\n"
         "Я уже в очереди на твой вопрос.\n\n"
-        "Пришлю результат в рабочее время — если заявка пришла ночью, жди утром ☽\n\n"
+        "Расклад пришлю прямо сюда, в этот чат — в рабочее время ☽\n\n"
         "Если хочешь уточнить формулировку вопроса — напиши прямо сейчас."
     ),
     "day": (
         "🌙 *Оплата подтверждена — расклад на день*\n\n"
         "Твоя заявка в очереди.\n\n"
-        "Расклад пришлю в рабочее время — постараюсь максимально быстро ☽"
+        "Расклад пришлю прямо сюда — в рабочее время, постараюсь максимально быстро ☽"
     ),
     "mini": (
         "🌙 *Оплата подтверждена — мини-расклад*\n\n"
-        "Напишу тебе лично — согласуем удобный момент для сессии.\n\n"
-        "Формат (голос или текст) выберем вместе ☽"
+        "Для согласования времени и формата сессии — напиши мне лично:\n\n"
+        f"👉 @{CONTACT_UN}\n\n"
+        "Жду тебя там ☽"
     ),
     "full": (
         "🌙 *Оплата подтверждена — большой расклад*\n\n"
         "Рада, что ты здесь.\n\n"
-        "Напишу тебе лично — согласуем время для нашей сессии.\n\n"
-        "Всё что нужно — это ты и твой вопрос. Больше ничего готовить не нужно ☽"
+        "Напиши мне лично — согласуем время для нашей сессии:\n\n"
+        f"👉 @{CONTACT_UN}\n\n"
+        "Всё что нужно — это ты и твой вопрос ☽"
     ),
 }
 
@@ -597,6 +617,231 @@ async def support_msg_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     return ConversationHandler.END
 
+# ── DELIVERY SYSTEM ───────────────────────────────────────────────────────────
+# /send <user_id>  — начать доставку расклада клиенту
+# Затем ты присылаешь фото+текст (caption) — бот пересылает клиенту
+
+async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Начать сессию доставки расклада. /send <user_id>"""
+    if not is_admin(update.effective_user): return
+
+    if not ctx.args:
+        await update.message.reply_text(
+            "Использование: /send <user_id>\n\n"
+            "Найди ID в /clients — у каждой заявки есть ID клиента."
+        )
+        return
+
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+
+    with db() as c:
+        user_row = c.execute(
+            "SELECT * FROM users WHERE user_id=?", (uid,)
+        ).fetchone()
+        order_row = c.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status='confirmed' "
+            "ORDER BY paid_at DESC LIMIT 1", (uid,)
+        ).fetchone()
+
+    if not user_row:
+        await update.message.reply_text(f"❗ Пользователь {uid} не найден.")
+        return
+
+    name = user_row["first_name"] or str(uid)
+    un   = f" @{user_row['username']}" if user_row["username"] else ""
+    svc  = SERVICES.get(order_row["service"], {}).get("name", "?") if order_row else "?"
+
+    # сохраняем сессию доставки
+    order_id = order_row["id"] if order_row else None
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO send_sessions (admin_id, target_uid, target_name, order_id) "
+            "VALUES (?,?,?,?)",
+            (update.effective_user.id, uid, name, order_id)
+        )
+
+    await update.message.reply_text(
+        f"📤 *Режим доставки включён*\n\n"
+        f"Клиент: {name}{un}\n"
+        f"Услуга: {svc}\n\n"
+        f"Отправь фото с подписью (caption) — бот перешлёт клиенту.\n"
+        f"Можно отправить только текст или только фото.\n\n"
+        f"/cancel\\_send — отменить",
+        parse_mode="Markdown"
+    )
+
+async def cmd_cancel_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user): return
+    with db() as c:
+        c.execute("DELETE FROM send_sessions WHERE admin_id=?", (update.effective_user.id,))
+    await update.message.reply_text("❌ Режим доставки отменён.")
+
+async def handle_admin_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Перехватывает фото/текст от админа в режиме доставки и пересылает клиенту."""
+    if not is_admin(update.effective_user): return False
+
+    with db() as c:
+        session = c.execute(
+            "SELECT * FROM send_sessions WHERE admin_id=?",
+            (update.effective_user.id,)
+        ).fetchone()
+
+    if not session:
+        return False  # не в режиме доставки — обрабатывать дальше
+
+    uid       = session["target_uid"]
+    name      = session["target_name"]
+    order_id  = session["order_id"]
+    msg       = update.message
+
+    try:
+        # фото + подпись
+        if msg.photo:
+            caption = msg.caption or ""
+            full_caption = f"🌙 *Твой расклад*\n\n{caption}" if caption else "🌙 *Твой расклад*"
+            await ctx.bot.send_photo(
+                chat_id=uid,
+                photo=msg.photo[-1].file_id,
+                caption=full_caption,
+                parse_mode="Markdown"
+            )
+        # только текст
+        elif msg.text and not msg.text.startswith("/"):
+            await ctx.bot.send_message(
+                chat_id=uid,
+                text=f"🌙 *Твой расклад*\n\n{msg.text}",
+                parse_mode="Markdown"
+            )
+        else:
+            return False
+
+        # помечаем заказ как доставленный
+        if order_id:
+            with db() as c:
+                c.execute(
+                    "UPDATE orders SET status='delivered' WHERE id=?", (order_id,)
+                )
+
+        # удаляем сессию доставки
+        with db() as c:
+            c.execute("DELETE FROM send_sessions WHERE admin_id=?", (update.effective_user.id,))
+
+        await update.message.reply_text(
+            f"✅ Расклад доставлен клиенту {name} (ID {uid}).\n\n"
+            f"Если клиент ответит — бот пришлёт тебе уведомление с кнопкой «Ответить»."
+        )
+        return True
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠️ Не удалось доставить. Ошибка: {type(e).__name__}\n"
+            f"Клиент мог заблокировать бота."
+        )
+        return True
+
+async def handle_client_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Клиент написал что-то после получения расклада — пересылаем админу."""
+    uid  = update.effective_user.id
+    text = update.message.text or ""
+
+    # проверяем — есть ли у него доставленный заказ
+    with db() as c:
+        order = c.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status='delivered' "
+            "ORDER BY paid_at DESC LIMIT 1", (uid,)
+        ).fetchone()
+        user = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+
+    if not order:
+        return False  # не наш клиент с доставленным раскладом
+
+    name = user["first_name"] if user else str(uid)
+    un   = f" @{user['username']}" if user and user["username"] else ""
+
+    # сохраняем в таблицу ответов
+    with db() as c:
+        c.execute(
+            "INSERT INTO client_replies (user_id, order_id, message) VALUES (?,?,?)",
+            (uid, order["id"], text)
+        )
+
+    svc  = SERVICES.get(order["service"], {}).get("name", "?")
+
+    # уведомляем админа с кнопкой "Ответить"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"💬 Ответить {name}", callback_data=f"reply_client_{uid}")
+    ]])
+
+    await notify_admin_with_bot(
+        ctx,
+        f"💬 *Ответ клиента*\n\n"
+        f"👤 {name}{un}  |  ID: `{uid}`\n"
+        f"✨ {svc}\n\n"
+        f"{text}\n\n"
+        f"Или используй: `/send {uid}`",
+        reply_markup=kb
+    )
+    return True
+
+async def handle_reply_client_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Нажатие кнопки 'Ответить клиенту' — запускает сессию доставки."""
+    q = update.callback_query
+    if not is_admin(q.from_user): return
+    await q.answer()
+
+    uid = int(q.data.replace("reply_client_", ""))
+
+    with db() as c:
+        user_row = c.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        order_row = c.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status='delivered' "
+            "ORDER BY paid_at DESC LIMIT 1", (uid,)
+        ).fetchone()
+
+    name     = user_row["first_name"] if user_row else str(uid)
+    order_id = order_row["id"] if order_row else None
+
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO send_sessions (admin_id, target_uid, target_name, order_id) "
+            "VALUES (?,?,?,?)",
+            (q.from_user.id, uid, name, order_id)
+        )
+
+    await q.edit_message_reply_markup(reply_markup=None)
+    await ctx.bot.send_message(
+        chat_id=q.from_user.id,
+        text=f"📤 *Режим ответа включён*\n\n"
+             f"Клиент: {name} (ID {uid})\n\n"
+             f"Отправь фото с подписью или текст — перешлю клиенту.\n"
+             f"/cancel\\_send — отменить",
+        parse_mode="Markdown"
+    )
+
+async def notify_admin_with_bot(ctx, text: str, reply_markup=None):
+    """notify_admin с поддержкой reply_markup."""
+    global admin_id
+    if admin_id:
+        try:
+            await ctx.bot.send_message(
+                chat_id=admin_id, text=text,
+                parse_mode="Markdown", reply_markup=reply_markup
+            )
+            return
+        except Exception as e:
+            log.warning("Admin notify by ID failed: %s", type(e).__name__)
+    try:
+        await ctx.bot.send_message(
+            chat_id=f"@{ADMIN_UN}", text=text,
+            parse_mode="Markdown", reply_markup=reply_markup
+        )
+    except Exception as e:
+        log.warning("Admin notify by username failed: %s", type(e).__name__)
+
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
 async def cmd_clients(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user): return
@@ -896,9 +1141,22 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    # 1. Уточняющий вопрос (окно 24ч после большого расклада)
     if ctx.user_data.get("awaiting_ask"):
         await ask_question_received(update, ctx)
         return
+    # 2. Доставка расклада от админа
+    if is_admin(update.effective_user):
+        handled = await handle_admin_delivery(update, ctx)
+        if handled:
+            return
+    # 3. Ответ клиента на расклад (Да/Нет или день)
+    if update.message.text and not update.message.text.startswith("/"):
+        handled = await handle_client_reply(update, ctx)
+        if handled:
+            return
     await update.message.reply_text("/start — главное меню  |  /menu — услуги")
 
 # ── HEALTH CHECK SERVER (нужен для Render Web Service) ───────────────────────
@@ -990,6 +1248,9 @@ def main():
     app.add_handler(CommandHandler("support_list", cmd_support_list))
     app.add_handler(CommandHandler("reply",        cmd_reply))
     app.add_handler(CommandHandler("ask",          cmd_ask))
+    app.add_handler(CommandHandler("send",         cmd_send))
+    app.add_handler(CommandHandler("cancel_send",  cmd_cancel_send))
+    app.add_handler(CallbackQueryHandler(handle_reply_client_cb, pattern="^reply_client_"))
 
     log.info("Bot started")
     app.run_polling(drop_pending_updates=True)

@@ -3,7 +3,7 @@
 Tarot Bot — final production version
 ═══════════════════════════════════════════════════════════
 Переменные окружения (Render → Environment):
-  BOT_TOKEN      токен от @BotFather
+  TELEGRAM_TOKEN      токен от @BotFather
   ADMIN_UN       username без @
   CARD_NUMBER    номер карты
   CARD_NAME      имя на карте латиницей
@@ -31,7 +31,7 @@ from telegram.ext import (
 )
 
 # ── ENV ───────────────────────────────────────────────────────────────────────
-TOKEN       = os.environ["BOT_TOKEN"]
+TOKEN       = os.environ["TELEGRAM_TOKEN"]
 ADMIN_UN    = os.environ["ADMIN_UN"].lstrip("@")
 CARD_NUMBER = os.environ["CARD_NUMBER"]
 CARD_NAME   = os.environ["CARD_NAME"]

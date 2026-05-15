@@ -131,6 +131,15 @@ def init_db():
             order_id    INTEGER,
             created_at  TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS delivery_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id     INTEGER NOT NULL,
+            order_id    INTEGER,
+            type        TEXT DEFAULT 'text',
+            status      TEXT DEFAULT 'sent',
+            sent_at     TEXT DEFAULT (datetime('now'))
+        );
         """)
     log.info("Database ready")
 
@@ -680,8 +689,72 @@ async def cmd_cancel_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c.execute("DELETE FROM send_sessions WHERE admin_id=?", (update.effective_user.id,))
     await update.message.reply_text("❌ Режим доставки отменён.")
 
+async def _do_delivery(ctx, session, msg):
+    """Общая логика доставки — вызывается и из текста и из фото handler."""
+    uid      = session["target_uid"]
+    name     = session["target_name"]
+    order_id = session["order_id"]
+    admin_id_val = session["admin_id"]
+
+    hint = "\n\n_Если хочешь что-то спросить или поделиться впечатлением — напиши прямо сюда ☽_"
+    msg_type = "text"
+
+    try:
+        if msg.photo:
+            msg_type = "photo"
+            caption  = msg.caption or ""
+            full_cap = f"🌙 *Твой расклад*\n\n{caption}{hint}" if caption else f"🌙 *Твой расклад*{hint}"
+            await ctx.bot.send_photo(
+                chat_id=uid,
+                photo=msg.photo[-1].file_id,
+                caption=full_cap,
+                parse_mode="Markdown"
+            )
+        elif msg.text and not msg.text.startswith("/"):
+            await ctx.bot.send_message(
+                chat_id=uid,
+                text=f"🌙 *Твой расклад*\n\n{msg.text}{hint}",
+                parse_mode="Markdown"
+            )
+        else:
+            return False
+
+        # логируем успешную доставку
+        with db() as c:
+            c.execute(
+                "INSERT INTO delivery_log (user_id, order_id, type, status) VALUES (?,?,?,?)",
+                (uid, order_id, msg_type, "delivered")
+            )
+            if order_id:
+                c.execute(
+                    "UPDATE orders SET status='delivered' WHERE id=?", (order_id,)
+                )
+            c.execute("DELETE FROM send_sessions WHERE admin_id=?", (admin_id_val,))
+
+        await ctx.bot.send_message(
+            chat_id=admin_id_val,
+            text=f"✅ Расклад доставлен — {name} (ID {uid}).\n"
+                 f"Тип: {'фото' if msg_type == 'photo' else 'текст'}\n\n"
+                 f"Если клиент ответит — получишь уведомление с кнопкой «Ответить»."
+        )
+        return True
+
+    except Exception as e:
+        # логируем ошибку
+        with db() as c:
+            c.execute(
+                "INSERT INTO delivery_log (user_id, order_id, type, status) VALUES (?,?,?,?)",
+                (uid, order_id, msg_type, f"error:{type(e).__name__}")
+            )
+        await ctx.bot.send_message(
+            chat_id=admin_id_val,
+            text=f"⚠️ Не удалось доставить ({type(e).__name__}).\n"
+                 f"Клиент мог заблокировать бота."
+        )
+        return True
+
 async def handle_admin_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Перехватывает фото/текст от админа в режиме доставки и пересылает клиенту."""
+    """Перехватывает фото/текст от админа в режиме доставки."""
     if not is_admin(update.effective_user): return False
 
     with db() as c:
@@ -691,57 +764,9 @@ async def handle_admin_delivery(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ).fetchone()
 
     if not session:
-        return False  # не в режиме доставки — обрабатывать дальше
+        return False
 
-    uid       = session["target_uid"]
-    name      = session["target_name"]
-    order_id  = session["order_id"]
-    msg       = update.message
-
-    try:
-        # фото + подпись
-        if msg.photo:
-            caption = msg.caption or ""
-            full_caption = f"🌙 *Твой расклад*\n\n{caption}" if caption else "🌙 *Твой расклад*"
-            await ctx.bot.send_photo(
-                chat_id=uid,
-                photo=msg.photo[-1].file_id,
-                caption=full_caption,
-                parse_mode="Markdown"
-            )
-        # только текст
-        elif msg.text and not msg.text.startswith("/"):
-            await ctx.bot.send_message(
-                chat_id=uid,
-                text=f"🌙 *Твой расклад*\n\n{msg.text}",
-                parse_mode="Markdown"
-            )
-        else:
-            return False
-
-        # помечаем заказ как доставленный
-        if order_id:
-            with db() as c:
-                c.execute(
-                    "UPDATE orders SET status='delivered' WHERE id=?", (order_id,)
-                )
-
-        # удаляем сессию доставки
-        with db() as c:
-            c.execute("DELETE FROM send_sessions WHERE admin_id=?", (update.effective_user.id,))
-
-        await update.message.reply_text(
-            f"✅ Расклад доставлен клиенту {name} (ID {uid}).\n\n"
-            f"Если клиент ответит — бот пришлёт тебе уведомление с кнопкой «Ответить»."
-        )
-        return True
-
-    except Exception as e:
-        await update.message.reply_text(
-            f"⚠️ Не удалось доставить. Ошибка: {type(e).__name__}\n"
-            f"Клиент мог заблокировать бота."
-        )
-        return True
+    return await _do_delivery(ctx, session, update.message)
 
 async def handle_client_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Клиент написал что-то после получения расклада — пересылаем админу."""
@@ -841,6 +866,48 @@ async def notify_admin_with_bot(ctx, text: str, reply_markup=None):
         )
     except Exception as e:
         log.warning("Admin notify by username failed: %s", type(e).__name__)
+
+async def handle_admin_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Отдельный handler для фото от админа — нужен потому что фото не TEXT."""
+    if not is_admin(update.effective_user): return
+    with db() as c:
+        session = c.execute(
+            "SELECT * FROM send_sessions WHERE admin_id=?",
+            (update.effective_user.id,)
+        ).fetchone()
+    if not session:
+        await update.message.reply_text(
+            "Сначала укажи клиента: /send <user_id>"
+        )
+        return
+    await _do_delivery(ctx, session, update.message)
+
+async def cmd_delivered(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показывает лог доставок — статус по каждому."""
+    if not is_admin(update.effective_user): return
+    with db() as c:
+        rows = c.execute(
+            "SELECT dl.*, u.first_name, u.username FROM delivery_log dl "
+            "LEFT JOIN users u ON dl.user_id=u.user_id "
+            "ORDER BY dl.sent_at DESC LIMIT 20"
+        ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Доставок ещё не было.")
+        return
+
+    lines = ["📦 *Лог доставок (последние 20):*\n"]
+    for r in rows:
+        icon  = "✅" if r["status"] == "delivered" else "❌"
+        name  = r["first_name"] or str(r["user_id"])
+        un    = f" @{r['username']}" if r["username"] else ""
+        tp    = "📷" if r["type"] == "photo" else "📝"
+        lines.append(
+            f"{icon} {tp} {name}{un}  |  ID `{r['user_id']}`\n"
+            f"   {r['sent_at'][:16]}"
+            + (f"  |  {r['status']}" if r["status"] != "delivered" else "") + "\n"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
 async def cmd_clients(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1147,12 +1214,12 @@ async def fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if ctx.user_data.get("awaiting_ask"):
         await ask_question_received(update, ctx)
         return
-    # 2. Доставка расклада от админа
-    if is_admin(update.effective_user):
+    # 2. Текстовая доставка расклада от админа
+    if is_admin(update.effective_user) and update.message.text:
         handled = await handle_admin_delivery(update, ctx)
         if handled:
             return
-    # 3. Ответ клиента на расклад (Да/Нет или день)
+    # 3. Ответ клиента на расклад
     if update.message.text and not update.message.text.startswith("/"):
         handled = await handle_client_reply(update, ctx)
         if handled:
@@ -1227,7 +1294,7 @@ def main():
                 CallbackQueryHandler(back_menu,          pattern="^back_menu_"),
             ],
             SUPPORT_MESSAGE: [
-                MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, support_msg_received),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, support_msg_received),
             ],
         },
         fallbacks=[
@@ -1250,7 +1317,10 @@ def main():
     app.add_handler(CommandHandler("ask",          cmd_ask))
     app.add_handler(CommandHandler("send",         cmd_send))
     app.add_handler(CommandHandler("cancel_send",  cmd_cancel_send))
+    app.add_handler(CommandHandler("delivered",    cmd_delivered))
     app.add_handler(CallbackQueryHandler(handle_reply_client_cb, pattern="^reply_client_"))
+    # фото от админа — отдельный handler, не попадает в ConversationHandler
+    app.add_handler(MessageHandler(filters.PHOTO, handle_admin_photo))
 
     log.info("Bot started")
     app.run_polling(drop_pending_updates=True)
